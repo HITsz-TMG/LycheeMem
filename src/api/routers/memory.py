@@ -1,0 +1,1036 @@
+"""记忆端点：图谱、技能、检索。"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from starlette.concurrency import run_in_threadpool
+
+from src.api.dependencies import get_pipeline
+from src.api.models import (
+    DeleteResponse,
+    MemoryAppendTurnRequest,
+    MemoryAppendTurnResponse,
+    GraphResponse,
+    MemoryConsolidateRequest,
+    MemoryConsolidateResponse,
+    MemoryReasonRequest,
+    MemoryReasonResponse,
+    MemorySearchRequest,
+    MemorySearchResponse,
+    MemorySmartSearchRequest,
+    MemorySmartSearchResponse,
+    SkillsResponse,
+)
+
+logger = logging.getLogger("src.api")
+
+router = APIRouter()
+
+
+def _normalize_graph_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _build_tree_relationships(
+    composites: list[dict[str, Any]],
+) -> tuple[dict[str, set[str]], dict[str, str], dict[str, list[str]]]:
+    source_sets: dict[str, set[str]] = {}
+    explicit_candidates: dict[str, set[str]] = {}
+    parent_ids_with_explicit: set[str] = set()
+
+    for composite in composites:
+        composite_id = _normalize_graph_id(composite.get("composite_id"))
+        if not composite_id:
+            continue
+        source_sets[composite_id] = {
+            _normalize_graph_id(source_id)
+            for source_id in (composite.get("source_record_ids") or [])
+            if _normalize_graph_id(source_id)
+        }
+
+    for composite in composites:
+        parent_id = _normalize_graph_id(composite.get("composite_id"))
+        parent_sources = source_sets.get(parent_id, set())
+        for raw_child_id in (composite.get("child_composite_ids") or []):
+            child_id = _normalize_graph_id(raw_child_id)
+            child_sources = source_sets.get(child_id, set())
+            if (
+                child_id
+                and child_id != parent_id
+                and child_sources
+                and child_sources.issubset(parent_sources)
+                and len(parent_sources) > len(child_sources)
+            ):
+                explicit_candidates.setdefault(child_id, set()).add(parent_id)
+                parent_ids_with_explicit.add(parent_id)
+
+    inferred_candidates: dict[str, set[str]] = {}
+    composite_ids = list(source_sets.keys())
+    for parent_id in composite_ids:
+        if parent_id in parent_ids_with_explicit:
+            continue
+        parent_sources = source_sets[parent_id]
+        if not parent_sources:
+            continue
+
+        eligible_children = [
+            child_id
+            for child_id in composite_ids
+            if child_id != parent_id
+            and source_sets[child_id]
+            and source_sets[child_id].issubset(parent_sources)
+            and len(parent_sources) > len(source_sets[child_id])
+        ]
+
+        for child_id in eligible_children:
+            child_sources = source_sets[child_id]
+            has_intermediate = any(
+                mid_id not in {child_id, parent_id}
+                and source_sets[mid_id]
+                and child_sources.issubset(source_sets[mid_id])
+                and source_sets[mid_id].issubset(parent_sources)
+                and len(parent_sources) > len(source_sets[mid_id]) > len(child_sources)
+                for mid_id in eligible_children
+            )
+            if not has_intermediate:
+                inferred_candidates.setdefault(child_id, set()).add(parent_id)
+
+    parent_candidates = {child_id: set(parents) for child_id, parents in explicit_candidates.items()}
+    for child_id, parents in inferred_candidates.items():
+        parent_candidates.setdefault(child_id, set()).update(parents)
+
+    child_to_parent: dict[str, str] = {}
+    for child_id, parents in parent_candidates.items():
+        valid_parents = [parent_id for parent_id in parents if parent_id in source_sets]
+        if not valid_parents:
+            continue
+        child_to_parent[child_id] = min(
+            valid_parents,
+            key=lambda parent_id: (len(source_sets.get(parent_id, set())) or 10**9, parent_id),
+        )
+
+    parent_to_children: dict[str, list[str]] = {}
+    for child_id, parent_id in child_to_parent.items():
+        parent_to_children.setdefault(parent_id, []).append(child_id)
+    for child_ids in parent_to_children.values():
+        child_ids.sort(key=lambda child_id: (len(source_sets.get(child_id, set())), child_id))
+
+    return source_sets, child_to_parent, parent_to_children
+
+
+def _build_evidence_graph_payload(
+    data: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    records = [
+        record
+        for record in data.get("records", [])
+        if not bool(record.get("expired", False))
+    ]
+    evidence_nodes = list(data.get("evidence_nodes", []))
+
+    node_cache: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    records_with_parent: set[str] = set()
+
+    def _record_node(record: dict[str, Any]) -> dict[str, Any]:
+        record_id = _normalize_graph_id(record.get("record_id"))
+        if record_id in node_cache:
+            return node_cache[record_id]
+        node = {
+            "id": record_id,
+            "name": str(record.get("normalized_text") or record.get("semantic_text") or record_id)[:120],
+            "label": record.get("memory_type", "record"),
+            "node_kind": "record",
+            "properties": {
+                "semantic_text": record.get("semantic_text", ""),
+                "normalized_text": record.get("normalized_text", ""),
+                "entities": record.get("entities", []),
+                "tags": record.get("tags", []),
+                "temporal": record.get("temporal", {}),
+                "confidence": record.get("confidence", 1.0),
+                "created_at": record.get("created_at", ""),
+                "source_session": record.get("source_session", ""),
+                "source_role": record.get("source_role", ""),
+                "evidence_turn_range": record.get("evidence_turn_range", []),
+            },
+            "children": [],
+        }
+        node_cache[record_id] = node
+        return node
+
+    record_by_id = {
+        _normalize_graph_id(record.get("record_id")): record
+        for record in records
+        if _normalize_graph_id(record.get("record_id"))
+    }
+
+    for node in evidence_nodes:
+        node_id = _normalize_graph_id(node.get("node_id"))
+        if not node_id:
+            continue
+        record_ids = [
+            _normalize_graph_id(record_id)
+            for record_id in (node.get("record_ids") or [])
+            if _normalize_graph_id(record_id)
+        ]
+        children = [
+            _record_node(record_by_id[record_id])
+            for record_id in record_ids
+            if record_id in record_by_id
+        ]
+        evidence_node = {
+            "id": node_id,
+            "name": str(node.get("label") or node.get("key") or node_id)[:120],
+            "label": node.get("node_type", "evidence"),
+            "node_kind": "evidence",
+            "properties": {
+                "key": node.get("key", ""),
+                "label": node.get("label", ""),
+                "search_text": node.get("search_text", ""),
+                "record_ids": record_ids,
+                "record_count": len(record_ids),
+                "session_ids": node.get("session_ids", []),
+                "entities": node.get("entities", []),
+                "tags": node.get("tags", []),
+                "temporal": node.get("temporal", {}),
+                "metadata": node.get("metadata", {}),
+                "created_at": node.get("created_at", ""),
+                "updated_at": node.get("updated_at", ""),
+            },
+            "children": children,
+        }
+        node_cache[node_id] = evidence_node
+        for record_id in record_ids:
+            if record_id in record_by_id:
+                records_with_parent.add(record_id)
+                edges.append({
+                    "source": node_id,
+                    "target": record_id,
+                    "relation": "indexes_record",
+                })
+
+    for record_id, record in record_by_id.items():
+        _record_node(record)
+
+    roots = [
+        node_cache[_normalize_graph_id(node.get("node_id"))]
+        for node in evidence_nodes
+        if _normalize_graph_id(node.get("node_id")) in node_cache
+    ]
+    roots.extend(
+        node_cache[record_id]
+        for record_id in sorted(record_by_id)
+        if record_id not in records_with_parent
+    )
+
+    return list(node_cache.values()), edges, roots
+
+
+def _build_semantic_tree_payload(
+    data: dict[str, Any],
+    *,
+    session_store: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if data.get("evidence_nodes") and not data.get("composites"):
+        return _build_evidence_graph_payload(data)
+
+    records = [
+        record
+        for record in data.get("records", [])
+        if not bool(record.get("expired", False))
+    ]
+    composites = list(data.get("composites", []))
+
+    record_by_id = {
+        _normalize_graph_id(record.get("record_id")): record
+        for record in records
+        if _normalize_graph_id(record.get("record_id"))
+    }
+    composite_by_id = {
+        _normalize_graph_id(composite.get("composite_id")): composite
+        for composite in composites
+        if _normalize_graph_id(composite.get("composite_id"))
+    }
+
+    source_sets, child_to_parent, parent_to_children = _build_tree_relationships(composites)
+    covered_record_ids = set().union(*source_sets.values()) if source_sets else set()
+
+    node_cache: dict[str, dict[str, Any]] = {}
+    record_rank = {
+        _normalize_graph_id(record.get("record_id")): index
+        for index, record in enumerate(
+            sorted(
+                records,
+                key=lambda item: (
+                    str(item.get("created_at") or ""),
+                    _normalize_graph_id(item.get("record_id")),
+                ),
+            )
+        )
+        if _normalize_graph_id(record.get("record_id"))
+    }
+    episode_cache: dict[tuple[str, tuple[int, ...]], list[str]] = {}
+    record_episode_ids: dict[str, list[str]] = {}
+    episode_to_record_ids: dict[str, set[str]] = {}
+
+    def _normalize_turn_indices(raw_value: Any) -> list[int]:
+        if not isinstance(raw_value, list):
+            return []
+        result: list[int] = []
+        seen: set[int] = set()
+        for raw in raw_value:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value < 0 or value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        result.sort()
+        return result
+
+    def _truncate_text(text: str, max_chars: int = 80) -> str:
+        cleaned = " ".join(str(text or "").split())
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[: max_chars - 1].rstrip() + "…"
+
+    def _episode_node_id(session_id: str, turn_index: int) -> str:
+        return f"episode:{session_id}:{turn_index}"
+
+    def _canonical_record_id_for_episode(episode_id: str) -> str:
+        grounded_record_ids = episode_to_record_ids.get(episode_id, set())
+        if not grounded_record_ids:
+            return ""
+        return min(
+            grounded_record_ids,
+            key=lambda record_id: (record_rank.get(record_id, 10**9), record_id),
+        )
+
+    def _refresh_episode_grounding(episode_ids: list[str]) -> None:
+        for episode_id in episode_ids:
+            node = node_cache.get(episode_id)
+            if not node:
+                continue
+            grounded_record_ids = sorted(
+                episode_to_record_ids.get(episode_id, set()),
+                key=lambda record_id: (record_rank.get(record_id, 10**9), record_id),
+            )
+            node_props = node.setdefault("properties", {})
+            node_props["grounded_record_ids"] = grounded_record_ids
+            node_props["grounded_record_count"] = len(grounded_record_ids)
+            node_props["canonical_record_id"] = _canonical_record_id_for_episode(episode_id)
+
+    def _build_episode_nodes(record: dict[str, Any]) -> list[dict[str, Any]]:
+        if session_store is None:
+            return []
+
+        session_id = _normalize_graph_id(record.get("source_session"))
+        evidence_turns = _normalize_turn_indices(record.get("evidence_turn_range"))
+        record_id = _normalize_graph_id(record.get("record_id"))
+        if not session_id or not evidence_turns or not record_id:
+            return []
+
+        if record_id in record_episode_ids:
+            return [
+                node_cache[episode_id]
+                for episode_id in record_episode_ids[record_id]
+                if episode_id in node_cache
+            ]
+
+        cache_key = (session_id, tuple(evidence_turns))
+        if cache_key in episode_cache:
+            episode_ids = list(episode_cache[cache_key])
+            record_episode_ids[record_id] = episode_ids
+            for episode_id in episode_ids:
+                episode_to_record_ids.setdefault(episode_id, set()).add(record_id)
+            _refresh_episode_grounding(episode_ids)
+            return [node_cache[episode_id] for episode_id in episode_ids if episode_id in node_cache]
+
+        try:
+            turns = session_store.get_turn_window(
+                session_id,
+                min(evidence_turns),
+                max(evidence_turns),
+                window=0,
+            )
+        except Exception:
+            logger.exception("build episode nodes failed for session %s", session_id)
+            episode_cache[cache_key] = []
+            record_episode_ids[record_id] = []
+            return []
+
+        episode_ids: list[str] = []
+        for turn in turns:
+            try:
+                turn_index = int(turn.get("turn_index"))
+            except (TypeError, ValueError):
+                continue
+            episode_id = _episode_node_id(session_id, turn_index)
+            content = str(turn.get("content") or "")
+            if episode_id not in node_cache:
+                node_cache[episode_id] = {
+                    "id": episode_id,
+                    "name": _truncate_text(f"{turn.get('role', 'unknown')}: {content}", max_chars=120),
+                    "label": str(turn.get("role") or "dialogue") or "dialogue",
+                    "node_kind": "episode",
+                    "properties": {
+                        "content": content,
+                        "role": str(turn.get("role") or "unknown"),
+                        "session_id": session_id,
+                        "turn_index": turn_index,
+                        "created_at": str(turn.get("created_at") or ""),
+                        "deleted": bool(turn.get("deleted", False)),
+                        "grounded_record_ids": [],
+                        "grounded_record_count": 0,
+                        "canonical_record_id": "",
+                    },
+                    "children": [],
+                }
+            episode_ids.append(episode_id)
+            episode_to_record_ids.setdefault(episode_id, set()).add(record_id)
+
+        episode_cache[cache_key] = episode_ids
+        record_episode_ids[record_id] = episode_ids
+        _refresh_episode_grounding(episode_ids)
+        return [node_cache[episode_id] for episode_id in episode_ids if episode_id in node_cache]
+
+    def _build_record_node(record_id: str) -> dict[str, Any]:
+        record = record_by_id[record_id]
+        if record_id in node_cache:
+            return node_cache[record_id]
+        episode_nodes = _build_episode_nodes(record)
+        attached_episode_nodes = [
+            episode_node
+            for episode_node in episode_nodes
+            if str((episode_node.get("properties") or {}).get("canonical_record_id") or "") == record_id
+        ]
+        node = {
+            "id": record_id,
+            "name": str(record.get("normalized_text") or record.get("semantic_text") or record_id)[:120],
+            "label": record.get("memory_type", "record"),
+            "node_kind": "record",
+            "properties": {
+                "semantic_text": record.get("semantic_text", ""),
+                "entities": record.get("entities", []),
+                "confidence": record.get("confidence", 1.0),
+                "created_at": record.get("created_at", ""),
+                "source_record_count": 1,
+                "child_composite_count": 0,
+                "direct_record_count": 0,
+                "source_session": record.get("source_session", ""),
+                "source_role": record.get("source_role", ""),
+                "evidence_turn_range": record.get("evidence_turn_range", []),
+                "episodic_turn_count": len(episode_nodes),
+                "attached_episode_count": len(attached_episode_nodes),
+            },
+            "children": attached_episode_nodes,
+        }
+        node_cache[record_id] = node
+        for episode_node in attached_episode_nodes:
+            node_cache[episode_node["id"]] = episode_node
+        return node
+
+    def _build_composite_node(composite_id: str) -> dict[str, Any]:
+        composite = composite_by_id[composite_id]
+        if composite_id in node_cache:
+            return node_cache[composite_id]
+
+        child_ids = parent_to_children.get(composite_id, [])
+        covered_by_children = set().union(*(source_sets.get(child_id, set()) for child_id in child_ids)) if child_ids else set()
+        direct_record_ids = sorted(
+            record_id
+            for record_id in (source_sets.get(composite_id, set()) - covered_by_children)
+            if record_id in record_by_id
+        )
+
+        children = [_build_composite_node(child_id) for child_id in child_ids]
+        children.extend(_build_record_node(record_id) for record_id in direct_record_ids)
+
+        node = {
+            "id": composite_id,
+            "name": str(composite.get("normalized_text") or composite.get("semantic_text") or composite_id)[:120],
+            "label": composite.get("memory_type", "composite"),
+            "node_kind": "composite",
+            "properties": {
+                "semantic_text": composite.get("semantic_text", ""),
+                "source_record_ids": list(sorted(source_sets.get(composite_id, set()))),
+                "child_composite_ids": list(child_ids),
+                "child_composite_count": len(child_ids),
+                "direct_record_count": len(direct_record_ids),
+                "source_record_count": len(source_sets.get(composite_id, set())),
+                "confidence": composite.get("confidence", 1.0),
+                "created_at": composite.get("created_at", ""),
+            },
+            "children": children,
+        }
+        node_cache[composite_id] = node
+        return node
+
+    root_composite_ids = sorted(
+        composite_id
+        for composite_id in composite_by_id
+        if composite_id not in child_to_parent
+    )
+    root_record_ids = sorted(
+        record_id
+        for record_id in record_by_id
+        if record_id not in covered_record_ids
+    )
+
+    tree_roots = [_build_composite_node(composite_id) for composite_id in root_composite_ids]
+    tree_roots.extend(_build_record_node(record_id) for record_id in root_record_ids)
+
+    tree_edges: list[dict[str, Any]] = []
+    for parent_id, child_ids in parent_to_children.items():
+        for child_id in child_ids:
+            tree_edges.append({
+                "source": parent_id,
+                "target": child_id,
+                "relation": "composed_from_composite",
+            })
+
+    all_parent_ids = sorted(set(root_composite_ids) | set(parent_to_children.keys()))
+    for composite_id in all_parent_ids:
+        child_ids = parent_to_children.get(composite_id, [])
+        covered_by_children = set().union(*(source_sets.get(child_id, set()) for child_id in child_ids)) if child_ids else set()
+        direct_record_ids = sorted(
+            record_id
+            for record_id in (source_sets.get(composite_id, set()) - covered_by_children)
+            if record_id in record_by_id
+        )
+        for record_id in direct_record_ids:
+            tree_edges.append({
+                "source": composite_id,
+                "target": record_id,
+                "relation": "composed_from_record",
+            })
+
+    for record_id, record in record_by_id.items():
+        for episode_node in _build_episode_nodes(record):
+            tree_edges.append({
+                "source": record_id,
+                "target": episode_node["id"],
+                "relation": "grounded_in_turn",
+            })
+
+    tree_nodes = list(node_cache.values())
+    return tree_nodes, tree_edges, tree_roots
+
+
+def _build_memory_search_context(
+    pipeline,
+    *,
+    session_id: str | None,
+) -> dict[str, Any]:
+    """为显式 memory/search 请求补充可选的会话上下文。"""
+    if not session_id:
+        return {}
+
+    wm = pipeline.wm_manager
+    log = wm.session_store.get_or_create(session_id)
+    compressed_history = wm.compressor.render_context(log.turns, log.summaries)
+    active_turns = [t for t in log.turns if not t.get("deleted", False)]
+    return {
+        "compressed_history": compressed_history,
+        "raw_recent_turns": active_turns[-6:],
+        "wm_token_usage": wm.compressor.count_tokens(compressed_history),
+    }
+
+
+def run_memory_search(
+    pipeline,
+    req: MemorySearchRequest,
+) -> MemorySearchResponse:
+    """执行统一记忆检索。"""
+    sc = pipeline.search_coordinator
+
+    search_runtime = _build_memory_search_context(
+        pipeline,
+        session_id=req.session_id,
+    )
+    search_result = sc.run(
+        req.query,
+        session_id=req.session_id,
+        top_k=req.top_k,
+        include_skills=req.include_skills,
+        reference_time=req.reference_time,
+        **search_runtime,
+    )
+
+    semantic_results: list[dict[str, Any]] = []
+    if req.include_graph:
+        semantic_results = list(search_result.get("retrieved_graph_memories", []))
+
+    graph_results = list(semantic_results)
+    skill_results: list[dict[str, Any]] = []
+    if req.include_skills:
+        skill_results = list(search_result.get("retrieved_skills", []))
+
+    graph_total = 0
+    for item in semantic_results:
+        provenance = item.get("provenance")
+        if isinstance(provenance, list) and provenance:
+            graph_total += len(provenance)
+        else:
+            graph_total += 1
+
+    total = graph_total + len(skill_results)
+    return MemorySearchResponse(
+        query=req.query,
+        graph_results=graph_results,
+        semantic_results=semantic_results,
+        skill_results=skill_results,
+        total=total,
+    )
+
+
+def _build_memory_background_context(semantic_results: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in semantic_results:
+        context = str(item.get("constructed_context") or "").strip()
+        if not context:
+            provenance = item.get("provenance")
+            if isinstance(provenance, list):
+                lines: list[str] = []
+                for pv in provenance[:20]:
+                    if not isinstance(pv, dict):
+                        continue
+                    text = str(
+                        pv.get("semantic_text")
+                        or pv.get("fact_text")
+                        or pv.get("summary")
+                        or ""
+                    ).strip()
+                    if text:
+                        lines.append(f"- {text}")
+                context = "\n".join(lines)
+
+        if context and context not in seen:
+            seen.add(context)
+            parts.append(context)
+
+    return "\n\n".join(parts)
+
+
+def run_memory_smart_search(
+    pipeline,
+    req: MemorySmartSearchRequest,
+) -> dict[str, Any]:
+    """执行 one-shot 检索。"""
+    def _trim_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        if req.response_level == "full":
+            return payload
+
+        if req.response_level == "minimal":
+            return {
+                "query": payload["query"],
+                "mode": payload["mode"],
+                "background_context": payload.get("background_context", ""),
+                "total": payload["total"],
+            }
+
+        compact_payload: dict[str, Any] = {
+            "query": payload["query"],
+            "mode": payload["mode"],
+            "background_context": payload.get("background_context", ""),
+            "total": payload["total"],
+        }
+        return compact_payload
+
+    search_result = run_memory_search(
+        pipeline,
+        MemorySearchRequest(
+            query=req.query,
+            top_k=req.top_k,
+            session_id=req.session_id,
+            include_graph=req.include_graph,
+            include_skills=req.include_skills,
+            reference_time=req.reference_time,
+        ),
+    )
+
+    payload: dict[str, Any] = {
+        "query": search_result.query,
+        "mode": req.mode,
+        "graph_results": search_result.graph_results,
+        "semantic_results": search_result.semantic_results,
+        "skill_results": search_result.skill_results,
+        "total": search_result.total,
+        "background_context": _build_memory_background_context(search_result.semantic_results),
+    }
+    if req.mode == "compact":
+        payload["graph_results"] = []
+        payload["semantic_results"] = []
+        payload["skill_results"] = []
+
+    return _trim_payload(payload)
+
+
+def run_memory_append_turn(
+    pipeline,
+    req: MemoryAppendTurnRequest,
+) -> MemoryAppendTurnResponse:
+    """向 session store 追加单条宿主对话轮次，供后续 consolidate 使用。"""
+    pipeline.wm_manager.session_store.append_turn(
+        req.session_id,
+        req.role,
+        req.content,
+        token_count=req.token_count,
+        created_at=req.created_at,
+        speaker=req.speaker,
+    )
+    log = pipeline.wm_manager.session_store.get_or_create(req.session_id)
+    return MemoryAppendTurnResponse(
+        status="appended",
+        session_id=req.session_id,
+        turn_count=len(log.turns),
+    )
+
+
+def run_memory_consolidate(
+    pipeline,
+    req: MemoryConsolidateRequest,
+) -> MemoryConsolidateResponse:
+    """执行长期记忆固化，供 HTTP Router 与 MCP 共享。
+
+    使用固化水位线：只处理自上次固化以来新增的 turns，
+    避免整个 session 被重复固化。
+    """
+    import threading
+
+    store = pipeline.wm_manager.session_store
+    log = store.get_or_create(req.session_id)
+    watermark = log.last_consolidated_turn_index
+    raw_total = len(log.turns)
+
+    effective_watermark = 0 if req.force_ingest else watermark
+    turns = [t for t in log.turns[effective_watermark:] if not t.get("deleted", False)]
+
+    if not turns and not req.flush_session:
+        return MemoryConsolidateResponse(
+            status="skipped",
+            skipped_reason="no_new_turns",
+            steps=[{"name": "watermark_check", "status": "skipped",
+                    "detail": f"自水位线({watermark})以来无新增 turns，跳过固化"}],
+        )
+
+    if req.background:
+        def _run() -> None:
+            try:
+                result = pipeline.consolidator.run(
+                    turns=turns,
+                    session_id=req.session_id,
+                    turn_index_offset=effective_watermark,
+                    skip_skills=req.skip_skills,
+                    flush_session=req.flush_session,
+                    session_date=req.session_date,
+                )
+                raw_consumed = result.get("turns_consumed")
+                consumed = int(len(turns) if raw_consumed is None else raw_consumed)
+                store.set_last_consolidated_turn_index(
+                    req.session_id,
+                    min(raw_total, effective_watermark + max(0, consumed)),
+                )
+            except Exception:
+                logger.exception("background consolidation failed session=%s", req.session_id)
+
+        thread = threading.Thread(
+            target=_run,
+            daemon=True,
+            name=f"consolidate-{req.session_id[:8]}",
+        )
+        thread.start()
+        return MemoryConsolidateResponse(status="started")
+
+    result = pipeline.consolidator.run(
+        turns=turns,
+        session_id=req.session_id,
+        turn_index_offset=effective_watermark,
+        skip_skills=req.skip_skills,
+        flush_session=req.flush_session,
+        session_date=req.session_date,
+    )
+    raw_consumed = result.get("turns_consumed")
+    consumed = int(len(turns) if raw_consumed is None else raw_consumed)
+    store.set_last_consolidated_turn_index(
+        req.session_id,
+        min(raw_total, effective_watermark + max(0, consumed)),
+    )
+    return MemoryConsolidateResponse(
+        status="skipped" if result.get("skipped_reason") else "done",
+        entities_added=result.get("entities_added", 0),
+        skills_added=result.get("skills_added", 0),
+        facts_added=result.get("facts_added", 0),
+        skipped_reason=result.get("skipped_reason"),
+        steps=result.get("steps", []),
+    )
+
+
+def _run_memory_reason(
+    pipeline,
+    req: MemoryReasonRequest,
+) -> MemoryReasonResponse:
+    """在线程池中执行推理，避免阻塞 FastAPI 事件循环。"""
+    wm = pipeline.wm_manager
+
+    if req.append_to_session:
+        wm_result = wm.run(
+            session_id=req.session_id,
+            user_query=req.user_query,
+        )
+        compressed_history = wm_result["compressed_history"]
+        wm_token_usage = wm_result["wm_token_usage"]
+    else:
+        log = wm.session_store.get_or_create(req.session_id)
+        compressed_history = wm.compressor.render_context(log.turns, log.summaries)
+        wm_token_usage = wm.compressor.count_tokens(compressed_history)
+
+    result = pipeline.reasoner.run(
+        user_query=req.user_query,
+        compressed_history=compressed_history,
+        background_context=req.background_context,
+        skill_reuse_plan=req.skill_reuse_plan,
+        retrieved_skills=req.retrieved_skills,
+        reference_time=req.reference_time,
+    )
+
+    if req.append_to_session:
+        wm.append_assistant_turn(
+            req.session_id,
+            result["final_response"],
+        )
+
+    return MemoryReasonResponse(
+        response=result["final_response"],
+        session_id=req.session_id,
+        wm_token_usage=wm_token_usage,
+    )
+
+
+
+
+@router.post("/memory/search", response_model=MemorySearchResponse)
+async def memory_search(req: MemorySearchRequest, pipeline=Depends(get_pipeline)):
+    """统一记忆检索：同时查询图谱和技能库。"""
+    return await run_in_threadpool(run_memory_search, pipeline, req)
+
+
+@router.post("/memory/smart-search", response_model=MemorySmartSearchResponse)
+async def memory_smart_search(
+    req: MemorySmartSearchRequest,
+    pipeline=Depends(get_pipeline),
+):
+    """执行 one-shot 检索。"""
+    return await run_in_threadpool(run_memory_smart_search, pipeline, req)
+
+
+
+
+@router.post("/memory/append-turn", response_model=MemoryAppendTurnResponse)
+async def memory_append_turn(
+    req: MemoryAppendTurnRequest,
+    pipeline=Depends(get_pipeline),
+):
+    """追加单条外部宿主对话轮次，为后续 consolidate 提供 transcript bridge。"""
+    return await run_in_threadpool(run_memory_append_turn, pipeline, req)
+
+
+
+
+@router.post("/memory/reason", response_model=MemoryReasonResponse)
+async def memory_reason(
+    req: MemoryReasonRequest,
+    pipeline=Depends(get_pipeline),
+):
+    """基于检索上下文对用户查询进行最终推理，生成 assistant 回答。
+
+    当 append_to_session=True（默认）时：
+    - 将用户问题追加到会话（含 token 预算检查与按需压缩），作为下一轮历史
+    - 将 assistant 回答追加到会话，供后续 POST /memory/consolidate 使用
+
+    当 append_to_session=False 时：仅读取历史，不写入会话。
+    """
+    return await run_in_threadpool(_run_memory_reason, pipeline, req)
+
+
+
+
+@router.post("/memory/consolidate", response_model=MemoryConsolidateResponse)
+async def memory_consolidate(
+    req: MemoryConsolidateRequest,
+    pipeline=Depends(get_pipeline),
+):
+    """对当前会话进行记忆萃取固化，提取实体/事实写入图谱，提取技能写入技能库。
+
+    background=True（默认）：在后台线程中异步执行，立即返回 status="started"；
+        与 Pipeline 内部行为一致，适合生产调用（固化耗时通常超过 60 秒）。
+    background=False：同步等待完成后返回详细结果，适合调试/验证。
+    """
+    return await run_in_threadpool(run_memory_consolidate, pipeline, req)
+
+
+
+
+@router.get("/memory/graph", response_model=GraphResponse)
+async def get_graph(
+    pipeline=Depends(get_pipeline),
+    mode: str = Query(
+        default="cleaned",
+        description=(
+            "cleaned（默认）：输出层级记忆树，保留父/子 composite 以及直接叶子 record，"
+            "用于前端树视图展示；"
+            "debug：导出全部 records + composites 的底层关系，用于底层排查。"
+        ),
+    ),
+):
+    sc = pipeline.search_coordinator
+    try:
+        data = sc.semantic_engine.export_debug()
+        if mode == "cleaned":
+            nodes, edges, tree_roots = _build_semantic_tree_payload(
+                data,
+                session_store=pipeline.wm_manager.session_store,
+            )
+            return GraphResponse(nodes=nodes, edges=edges, tree_roots=tree_roots)
+
+        if data.get("evidence_nodes") and not data.get("composites"):
+            nodes, edges, tree_roots = _build_evidence_graph_payload(data)
+            return GraphResponse(nodes=nodes, edges=edges, tree_roots=tree_roots)
+
+        nodes = []
+        edges = []
+        for u in data.get("records", []):
+            rid = u.get("record_id", "")
+            nodes.append({
+                "id": rid,
+                "name": u.get("normalized_text", "")[:80],
+                "label": u.get("memory_type", "record"),
+                "node_kind": "record",
+                "properties": {
+                    "semantic_text": u.get("semantic_text", ""),
+                    "entities": u.get("entities", []),
+                    "confidence": u.get("confidence", 1.0),
+                    "created_at": u.get("created_at", ""),
+                },
+            })
+        for s in data.get("composites", []):
+            composite_id = s.get("composite_id", "")
+            nodes.append({
+                "id": composite_id,
+                "name": s.get("normalized_text", "")[:80],
+                "label": s.get("memory_type", "composite"),
+                "node_kind": "composite",
+                "properties": {
+                    "semantic_text": s.get("semantic_text", ""),
+                    "source_record_ids": s.get("source_record_ids", []),
+                    "child_composite_ids": s.get("child_composite_ids", []),
+                },
+            })
+            for src_id in s.get("source_record_ids", []):
+                edges.append({
+                    "source": composite_id,
+                    "target": src_id,
+                    "relation": "composed_from",
+                })
+        _, _, tree_roots = _build_semantic_tree_payload(
+            data,
+            session_store=pipeline.wm_manager.session_store,
+        )
+        return GraphResponse(nodes=nodes, edges=edges, tree_roots=tree_roots)
+    except Exception as exc:
+        logger.exception("export_debug failed")
+        raise HTTPException(status_code=500, detail=f"Export failed: {exc}")
+
+
+@router.get("/memory/graph/search", response_model=GraphResponse)
+async def search_graph(
+    q: str = Query(..., min_length=1, description="搜索关键词"),
+    top_k: int = Query(default=10, ge=1, le=100),
+    pipeline=Depends(get_pipeline),
+):
+    """按关键词搜索记忆条目，返回匹配结果。"""
+    sc = pipeline.search_coordinator
+    try:
+        results = sc.semantic_engine._sqlite.fulltext_search(q, limit=top_k)
+        nodes = []
+        for r in results:
+            nodes.append({
+                "id": r.get("record_id", ""),
+                "name": r.get("normalized_text", "")[:80],
+                "label": r.get("memory_type", "record"),
+                "properties": {
+                    "semantic_text": r.get("semantic_text", ""),
+                    "entities": r.get("entities", []),
+                    "is_anchor": True,
+                },
+            })
+        return GraphResponse(nodes=nodes, edges=[])
+    except Exception:
+        logger.exception("Compact graph search failed")
+        raise HTTPException(status_code=500, detail="Graph search failed")
+
+
+@router.delete("/memory/graph/clear", response_model=DeleteResponse)
+async def clear_all_graph(
+    pipeline=Depends(get_pipeline),
+):
+    """清空所有语义记忆。"""
+    sc = pipeline.search_coordinator
+    try:
+        result = sc.semantic_engine.delete_all()
+        structural_deleted = result.get(
+            "composites_deleted",
+            result.get("evidence_nodes_deleted", 0),
+        )
+        return DeleteResponse(
+            message=(
+                f"Compact memory cleared "
+                f"(records_deleted={result.get('records_deleted', 0)}, "
+                f"structural_nodes_deleted={structural_deleted})."
+            )
+        )
+    except Exception as exc:
+        logger.exception("delete_all_for_user failed")
+        raise HTTPException(status_code=500, detail=f"Clear failed: {exc}")
+
+
+
+
+@router.get("/memory/skills", response_model=SkillsResponse)
+async def get_skills(pipeline=Depends(get_pipeline)):
+    skill_store = pipeline.search_coordinator.skill_store
+    skills = skill_store.get_all()
+    return SkillsResponse(skills=skills, total=len(skills))
+
+
+# NOTE: 固定路径 /memory/skills/clear 必须在参数化路径 /memory/skills/{skill_id} 前定义，
+# 否则 FastAPI 会将 "clear" 当作 skill_id 参数处理。
+@router.delete("/memory/skills/clear", response_model=DeleteResponse)
+async def clear_all_skills(
+    pipeline=Depends(get_pipeline),
+):
+    """清空所有技能记忆。"""
+    skill_store = pipeline.search_coordinator.skill_store
+    if hasattr(skill_store, "delete_all"):
+        skill_store.delete_all()
+    else:
+        all_skills = skill_store.get_all()
+        ids = [s.get("id") or s.get("skill_id") or "" for s in all_skills]
+        ids = [i for i in ids if i]
+        if ids:
+            skill_store.delete(ids)
+    return DeleteResponse(message="All skills cleared.")
+
+
+@router.delete("/memory/skills/{skill_id}", response_model=DeleteResponse)
+async def delete_skill(skill_id: str, pipeline=Depends(get_pipeline)):
+    """删除指定技能条目。"""
+    skill_store = pipeline.search_coordinator.skill_store
+    skill_store.delete([skill_id])
+    return DeleteResponse(message=f"Skill '{skill_id}' deleted.")

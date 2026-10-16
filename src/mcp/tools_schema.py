@@ -1,0 +1,154 @@
+"""MCP tool schemas exposed by LycheeMem."""
+
+TOOLS_SCHEMA = [
+    {
+        "name": "lychee_memory_smart_search",
+        "description": (
+            "Primary recall path for agents. Performs LycheeMem search and can return a compact "
+            "background_context built directly from retrieved memory. Prefer response_level=minimal "
+            "for normal agent use, and switch to full only for debugging."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索问题，自然语言。",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "每个来源最多返回条数。",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "可选，会话 ID；提供后会注入该会话的近期上下文，改进 state-conditioned retrieval。",
+                },
+                "include_graph": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否检索语义长期记忆（兼容旧字段名 include_graph）。",
+                },
+                "include_skills": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否检索技能库（程序性工作流）。",
+                },
+                "mode": {
+                    "type": "string",
+                    "default": "full",
+                    "description": "返回模式：raw/full 返回检索结果；compact 仅返回轻量上下文。",
+                },
+                "response_level": {
+                    "type": "string",
+                    "default": "minimal",
+                    "description": "返回层级：minimal 仅返回 query/mode/background_context/total；compact 返回轻量调试字段；full 返回完整检索明细。",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "lychee_memory_search",
+        "description": (
+            "Developer-facing raw retrieval tool. Retrieve relevant information from LycheeMem "
+            "structured long-term memory when you explicitly want the raw semantic_results "
+            "(legacy alias: graph_results) and skill_results payload. For normal agent use, prefer lychee_memory_smart_search."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language memory query.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Maximum number of results to return per source.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session ID to inject recent conversation context into retrieval.",
+                },
+                "include_graph": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Whether to include semantic memory (legacy field name kept for compatibility).",
+                },
+                "include_skills": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Whether to include procedural skill memory.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "lychee_memory_append_turn",
+        "description": (
+            "Append one natural-language conversation turn from an external host into LycheeMem's "
+            "session store. Call it after every completed dialogue turn so both the user turn and "
+            "the assistant reply are mirrored into the same session_id, even if you do not "
+            "consolidate on that turn. Do not use it for raw tool invocations, tool arguments, tool "
+            "outputs, or other orchestration-only traces unless the host explicitly wants those "
+            "artifacts stored as memory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "LycheeMem session id used to accumulate mirrored host turns.",
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Conversation role, typically user or assistant.",
+                },
+                "speaker": {
+                    "type": "string",
+                    "description": (
+                        "Optional named participant identity for imported multi-party conversations; "
+                        "kept separate from the transport role."
+                    ),
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Raw turn text to append into LycheeMem's session store.",
+                },
+                "token_count": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "Optional token count if the host already knows it.",
+                },
+            },
+            "required": ["session_id", "role", "content"],
+        },
+    },
+    {
+        "name": "lychee_memory_consolidate",
+        "description": (
+            "Persist new long-term memory after a conversation. Call it only after the relevant "
+            "natural-language user and assistant turns have already been mirrored with "
+            "lychee_memory_append_turn. Use it when the conversation introduced new facts, "
+            "entities, preferences, relationships, or reusable procedures that should be stored "
+            "for future retrieval."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Existing session ID that already contains persisted turns.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "True runs consolidation asynchronously; false waits for completion.",
+                },
+            },
+            "required": ["session_id"],
+        },
+    },
+]

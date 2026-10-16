@@ -1,0 +1,292 @@
+"""Compact Semantic Encoder。
+
+流水线：对话 → 单次 LLM 调用（类型化提取 + 指代消解 + action metadata 标注）→ MemoryRecord 列表。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from src.llm.base import BaseLLM, set_llm_call_source
+from src.memory.semantic.models import MemoryRecord, VALID_MEMORY_TYPES
+from src.memory.semantic.prompts import COMPACT_ENCODING_SYSTEM
+
+
+class CompactSemanticEncoder:
+    """Compact Semantic Encoder：将对话轮次编码为 MemoryRecord 列表。"""
+
+    def __init__(self, llm: BaseLLM):
+        self._llm = llm
+        self.last_disambiguation_context: str = ""
+
+    def encode_conversation(
+        self,
+        current_turns: list[dict[str, Any]],
+        *,
+        previous_turns: list[dict[str, Any]] | None = None,
+        reference_context: str | None = None,
+        session_id: str = "",
+        turn_index_offset: int = 0,
+        session_date: str | None = None,
+    ) -> list[MemoryRecord]:
+        """单次 LLM 调用完成抽取 + 指代消解 + metadata 标注。
+
+        Args:
+            current_turns: 需要处理的当前对话轮次
+            previous_turns: 兼容旧调用的最近上文轮次（只作只读消歧参考，可选）
+            reference_context: 同 session 内的简短只读消歧上下文，优先于 previous_turns。
+                典型内容是上一窗口输出的 disambiguation_context 和少量已有
+                semantic_text；不能作为新记录的证据来源。
+            session_id: 会话 ID
+            turn_index_offset: current_turns 在完整 session 中的起始 turn 索引
+            session_date: 对话发生的日期（自由文本，如 "May 8, 2023"）。
+                提供后将作为显式时间锚点注入 system prompt，
+                指导 LLM 将相对时间表达（yesterday/last week/next month）
+                转换为绝对日期。
+
+        Returns:
+            编码完成的 MemoryRecord 列表
+        """
+        records, disambiguation_context = self.encode_conversation_with_disambiguation(
+            current_turns,
+            previous_turns=previous_turns,
+            reference_context=reference_context,
+            session_id=session_id,
+            turn_index_offset=turn_index_offset,
+            session_date=session_date,
+        )
+        self.last_disambiguation_context = disambiguation_context
+        return records
+
+    def encode_conversation_with_disambiguation(
+        self,
+        current_turns: list[dict[str, Any]],
+        *,
+        previous_turns: list[dict[str, Any]] | None = None,
+        reference_context: str | None = None,
+        session_id: str = "",
+        turn_index_offset: int = 0,
+        session_date: str | None = None,
+    ) -> tuple[list[MemoryRecord], str]:
+        """Encode turns and return the disambiguation note without shared state."""
+        raw_records, disambiguation_context = self._encode_records_with_disambiguation(
+            current_turns,
+            previous_turns or [],
+            session_date=session_date,
+            reference_context=reference_context,
+        )
+        if not raw_records:
+            return [], disambiguation_context
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        results: list[MemoryRecord] = []
+
+        for raw in raw_records:
+            semantic_text = raw.get("semantic_text", "")
+            if not semantic_text.strip():
+                continue
+
+            memory_type = raw.get("memory_type", "fact")
+            if memory_type not in VALID_MEMORY_TYPES:
+                memory_type = "fact"
+
+            # normalized_text 由 Python 规则生成，不依赖 LLM 输出
+            normalized_text = f"{memory_type}: {semantic_text}"
+
+            raw_src = raw.get("source_role", "")
+            source_role = raw_src if raw_src in ("user", "assistant", "both") else ""
+
+            record_id = self._make_record_id(semantic_text)
+
+            record = MemoryRecord(
+                record_id=record_id,
+                memory_type=memory_type,
+                semantic_text=semantic_text,
+                normalized_text=normalized_text,
+                entities=raw.get("entities", []),
+                temporal=raw.get("temporal", {}),
+                tags=raw.get("tags", []),
+                confidence=1.0,
+                evidence_turn_range=self._normalize_evidence_turns(
+                    raw.get("evidence_turns", []),
+                    turn_index_offset=turn_index_offset,
+                    turn_count=len(current_turns),
+                ),
+                source_session=session_id,
+                source_role=source_role,
+                created_at=now_iso,
+                updated_at=now_iso,
+            )
+            results.append(record)
+
+        return results, disambiguation_context
+
+    # ──────────────────────────────────────
+    # 单次 LLM 编码（抽取 + 指代消解 + metadata）
+    # ──────────────────────────────────────
+
+    def _encode_records(
+        self,
+        current_turns: list[dict[str, Any]],
+        previous_turns: list[dict[str, Any]],
+        session_date: str | None = None,
+        reference_context: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """单次 LLM 调用：输出包含全部字段的 record 列表。"""
+        records, disambiguation_context = self._encode_records_with_disambiguation(
+            current_turns,
+            previous_turns,
+            session_date=session_date,
+            reference_context=reference_context,
+        )
+        self.last_disambiguation_context = disambiguation_context
+        return records
+
+    def _encode_records_with_disambiguation(
+        self,
+        current_turns: list[dict[str, Any]],
+        previous_turns: list[dict[str, Any]],
+        session_date: str | None = None,
+        reference_context: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """单次 LLM 调用：输出 record 列表和本次消歧上下文。"""
+        disambiguation_context = ""
+        if reference_context is not None:
+            ref_text = reference_context.strip() or "(none)"
+        elif previous_turns:
+            ref_text = self._format_section(previous_turns)
+        else:
+            ref_text = "(none)"
+        curr_text = self._format_section(current_turns)
+
+        # session_date 注入 user message 头部，system prompt 保持不变。
+        # 调用方在 Python 侧可靠地提取日期后传入，encoder 不自行解析格式。
+        if session_date:
+            date_header = (
+                f"<SESSION_DATE>{session_date}</SESSION_DATE>\n"
+                # f"Use the SESSION_DATE above as \"today\" to convert all relative time "
+                # f"references (yesterday, last week, next month, etc.) to absolute dates.\n\n"
+            )
+        else:
+            date_header = ""
+
+        user_content = (
+            f"{date_header}"
+            f"<REFERENCE_CONTEXT>\n{ref_text}\n</REFERENCE_CONTEXT>\n\n"
+            f"<CURRENT_TURNS>\n{curr_text}\n</CURRENT_TURNS>"
+        )
+
+        set_llm_call_source("compact_encoding")
+        response = self._llm.generate([
+            {"role": "system", "content": COMPACT_ENCODING_SYSTEM},
+            {"role": "user", "content": user_content},
+        ])
+
+        try:
+            parsed = self._parse_json(response)
+            if isinstance(parsed, dict):
+                disambiguation_context = self._normalize_disambiguation_context(
+                    parsed.get("disambiguation_context", "")
+                )
+            records = parsed.get("records", [])
+            if isinstance(records, list):
+                return records, disambiguation_context
+        except (ValueError, json.JSONDecodeError):
+            pass
+        return [], disambiguation_context
+
+    # ──────────────────────────────────────
+    # 工具方法
+    # ──────────────────────────────────────
+
+    @staticmethod
+    def _make_record_id(semantic_text: str) -> str:
+        """SHA256(semantic_text) 作为记录 ID。
+
+        使用 semantic_text（保留完整语义、不裁剪时态信息）而非 normalized_text，
+        避免时间不同的同类事件因 normalized_text 相同而产生 ID 碰撞。
+        """
+        return hashlib.sha256(semantic_text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _format_section(turns: list[dict[str, Any]]) -> str:
+        rendered: list[str] = []
+        for turn_index, turn in enumerate(turns):
+            role = str(turn.get("role") or "unknown").strip() or "unknown"
+            speaker = str(turn.get("speaker") or "").strip()
+            content = str(turn.get("content") or "").strip()
+
+            # Imported multi-party datasets may preserve the participant name
+            # both as metadata and as a leading ``Name:`` prefix.  Keep a
+            # single authoritative speaker marker in the encoding input.
+            if speaker:
+                prefix = f"{speaker}:"
+                if content.casefold().startswith(prefix.casefold()):
+                    content = content[len(prefix):].lstrip()
+
+            attributes = [
+                f"index={turn_index}",
+                f"role={json.dumps(role, ensure_ascii=False)}",
+            ]
+            if speaker:
+                attributes.append(f"speaker={json.dumps(speaker, ensure_ascii=False)}")
+            rendered.append(
+                f"<TURN {' '.join(attributes)}>\n{content}\n</TURN>"
+            )
+        return "\n".join(rendered)
+
+    @staticmethod
+    def _parse_json(text: str) -> dict[str, Any]:
+        """从 LLM 输出中提取 JSON。"""
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = [line for line in lines if not line.strip().startswith("```")]
+            text = "\n".join(lines)
+        return json.loads(text)
+
+    @staticmethod
+    def _normalize_disambiguation_context(value: Any, *, max_chars: int = 1200) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            text = "\n".join(str(item).strip() for item in value if str(item).strip())
+        else:
+            text = str(value).strip()
+        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip()
+        return text
+
+    @staticmethod
+    def _normalize_evidence_turns(
+        evidence_turns: Any,
+        *,
+        turn_index_offset: int = 0,
+        turn_count: int | None = None,
+    ) -> list[int]:
+        if not isinstance(evidence_turns, list):
+            return []
+
+        normalized: list[int] = []
+        seen: set[int] = set()
+        base_offset = max(0, int(turn_index_offset or 0))
+        for raw in evidence_turns:
+            try:
+                local_index = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if local_index < 0:
+                continue
+            if turn_count is not None and local_index >= max(0, int(turn_count)):
+                continue
+            absolute_index = base_offset + local_index
+            if absolute_index < 0 or absolute_index in seen:
+                continue
+            seen.add(absolute_index)
+            normalized.append(absolute_index)
+        normalized.sort()
+        return normalized

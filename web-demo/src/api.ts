@@ -1,0 +1,498 @@
+import type {
+    ConsolidatorTrace,
+    GraphData,
+    GraphEdge,
+    GraphNode,
+    GraphTreeNode,
+    PipelineStatus,
+    PipelineTrace,
+    SessionInfo,
+    SkillItem,
+    Turn,
+} from "./types";
+
+
+export async function fetchSessions(): Promise<SessionInfo[]> {
+  const r = await fetch(`/sessions?limit=100`);
+  const data = await r.json();
+  return data.sessions || [];
+}
+
+export async function updateSessionMeta(sessionId: string, topic: string): Promise<void> {
+  await fetch(`/memory/session/${encodeURIComponent(sessionId)}/meta`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ topic }),
+  });
+}
+
+export async function fetchSessionTurns(
+  sessionId: string
+): Promise<{
+  turns: Turn[];
+  summaries: Array<{ boundary_index: number; content: string }>;
+  boundary_index: number;
+  wm_current_tokens: number;
+  wm_max_tokens: number;
+}> {
+  const r = await fetch(
+    `/memory/session/${encodeURIComponent(sessionId)}`
+  );
+  const data = await r.json();
+  const turns: Turn[] = data.turns || [];
+  const summaries: Array<{ boundary_index: number; content: string; token_count?: number }> =
+    (data.summaries || []).sort(
+      (a: { boundary_index: number }, b: { boundary_index: number }) =>
+        a.boundary_index - b.boundary_index
+    );
+
+  // 获取最新的 boundary_index（如果有压缩）
+  const boundaryIndex = summaries.length > 0 ? summaries[summaries.length - 1].boundary_index : -1;
+
+  return {
+    turns,  // 返回完整的 turns（包括被软删除的原始对话）
+    summaries,
+    boundary_index: boundaryIndex,
+    wm_current_tokens: data.wm_current_tokens ?? 0,
+    wm_max_tokens: data.wm_max_tokens ?? 128000,
+  };
+}
+
+
+
+export async function sendChatMessage(
+  sessionId: string,
+  message: string
+): Promise<{
+  response: string;
+  wm_token_usage?: number;
+  memories_retrieved?: number;
+  turn_input_tokens?: number;
+  turn_output_tokens?: number;
+  trace?: PipelineTrace | null;
+}> {
+  const r = await fetch(`/chat/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, message }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const detail =
+      (data as Record<string, string>)?.detail ||
+      (data as Record<string, string>)?.message ||
+      `HTTP ${r.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+export interface StreamStepEvent {
+  type: "step";
+  step: string;
+  status: "done";
+  wm_token_usage?: number;
+}
+
+export interface StreamTokenEvent {
+  type: "token";
+  content: string;
+}
+
+export interface StreamAnswerEvent {
+  type: "answer";
+  content: string;
+}
+
+export interface StreamDoneEvent {
+  type: "done";
+  session_id: string;
+  memories_retrieved: number;
+  wm_token_usage: number;  turn_input_tokens?: number;
+  turn_output_tokens?: number;  trace: PipelineTrace;
+}
+
+export type StreamEvent = StreamStepEvent | StreamTokenEvent | StreamAnswerEvent | StreamDoneEvent;
+
+/**
+ * SSE 流式对话。通过回调实时接收每个 pipeline 步骤的进度。
+ * 后端依次发送 step 事件（wm_manager / search），
+ * 然后在 reason 阶段发送多个 token 事件，最后发送 step:reason / answer / done。
+ */
+export async function streamChatMessage(
+  sessionId: string,
+  message: string,
+  callbacks: {
+    onStep?: (step: string, data: Record<string, unknown>) => void;
+    onToken?: (token: string) => void;
+    onAnswer?: (answer: string) => void;
+    onDone?: (data: StreamDoneEvent) => void;
+  },
+  images: string[] = [],  // 新增：Base64 图片列表
+  imageMimeTypes: string[] = []  // 新增：图片 MIME 类型列表
+): Promise<void> {
+  console.log("[streamChatMessage] Calling API with images:", images.length, "mimes:", imageMimeTypes.length);
+  
+  const requestBody = {
+    session_id: sessionId,
+    message,
+    images,
+    image_mime_types: imageMimeTypes,
+  };
+  
+  console.log("[streamChatMessage] Request body:", JSON.stringify({
+    ...requestBody,
+    images: images.map((_, i) => `image_${i} (${images[i].length} chars)`),
+  }, null, 2));
+  
+  const r = await fetch(`/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+
+  console.log("[streamChatMessage] Response status:", r.status);
+
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    const detail =
+      (data as Record<string, string>)?.detail ||
+      (data as Record<string, string>)?.message ||
+      `HTTP ${r.status}`;
+    throw new Error(detail);
+  }
+
+  const reader = r.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE messages are separated by double newlines
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data: ")) continue;
+      const jsonStr = line.slice(6).trim();
+      if (!jsonStr) continue;
+
+      let evt: Record<string, unknown>;
+      try {
+        evt = JSON.parse(jsonStr);
+      } catch {
+        continue;
+      }
+
+      if (evt.type === "step" && callbacks.onStep) {
+        callbacks.onStep(evt.step as string, evt);
+      } else if (evt.type === "token" && callbacks.onToken) {
+        callbacks.onToken(evt.content as string);
+      } else if (evt.type === "answer" && callbacks.onAnswer) {
+        callbacks.onAnswer(evt.content as string);
+      } else if (evt.type === "done" && callbacks.onDone) {
+        callbacks.onDone(evt as unknown as StreamDoneEvent);
+      }
+    }
+  }
+}
+
+function getNodeDisplayText(n: Record<string, unknown>): string {
+  const name =
+    (n?.name as string) ||
+    ((n?.properties as Record<string, unknown>)?.name as string);
+  const id = (n?.node_id as string) || (n?.id as string);
+  return String(name || id || "?");
+}
+
+function getNodeTypeLabel(n: Record<string, unknown>): string {
+  return String(
+    (n?.label as string) ||
+      ((n?.properties as Record<string, unknown>)?.label as string) ||
+      ""
+  );
+}
+
+function toGraphTreeNode(n: Record<string, unknown>): GraphTreeNode {
+  return {
+    id: (n.node_id as string) || (n.id as string),
+    label: getNodeDisplayText(n),
+    typeLabel: getNodeTypeLabel(n),
+    nodeKind: String((n.node_kind as string) || "record"),
+    properties: (n.properties as Record<string, unknown>) || n,
+    children: Array.isArray(n.children)
+      ? (n.children as Record<string, unknown>[]).map((child) => toGraphTreeNode(child))
+      : [],
+  };
+}
+
+export async function fetchGraphData(): Promise<GraphData> {
+  const r = await fetch(`/memory/graph`);
+  const data = await r.json();
+  const nodes: GraphNode[] = ((data.nodes || []) as Record<string, unknown>[]).map(
+    (n) => ({
+      id: (n.node_id as string) || (n.id as string),
+      label: getNodeDisplayText(n),
+      properties: (n.properties as Record<string, unknown>) || n,
+      typeLabel: getNodeTypeLabel(n),
+      nodeKind: (n.node_kind as string) || "record",
+    })
+  );
+  const edges: GraphEdge[] = ((data.edges || []) as Record<string, unknown>[]).map(
+    (e) => ({
+      source: e.source as string,
+      target: e.target as string,
+      relation: (e.relation as string) || "",
+      confidence: (e.confidence as number) || 0.5,
+      fact: (e.fact as string) || "",
+      evidence: (e.evidence as string) || "",
+      timestamp: (e.timestamp as string) || "",
+      source_session: (e.source_session as string) || "",
+    })
+  );
+  const treeRoots: GraphTreeNode[] = ((data.tree_roots || []) as Record<string, unknown>[]).map(
+    (node) => toGraphTreeNode(node)
+  );
+  return { nodes, edges, treeRoots };
+}
+
+export async function fetchGraphEdges(): Promise<GraphEdge[]> {
+  const r = await fetch(`/memory/graph`);
+  const data = await r.json();
+  const edges: GraphEdge[] = ((data.edges || []) as Record<string, unknown>[]).map(
+    (e) => ({
+      source: e.source as string,
+      target: e.target as string,
+      relation: (e.relation as string) || "",
+      confidence: (e.confidence as number) || 0.5,
+      fact: (e.fact as string) || "",
+      evidence: (e.evidence as string) || "",
+      timestamp: (e.timestamp as string) || "",
+      source_session: (e.source_session as string) || "",
+    })
+  );
+  edges.sort((a, b) =>
+    String(b.timestamp || "").localeCompare(String(a.timestamp || ""))
+  );
+  return edges.slice(0, 80);
+}
+
+export async function fetchSkills(): Promise<SkillItem[]> {
+  const r = await fetch(`/memory/skills`);
+  const data = await r.json();
+  return data.skills || [];
+}
+
+export async function fetchPipelineStatus(): Promise<PipelineStatus> {
+  const r = await fetch(`/pipeline/status`);
+  const data = await r.json();
+  return {
+    session_count: data.session_count || 0,
+    graph_node_count: data.graph_node_count || 0,
+    graph_edge_count: data.graph_edge_count || 0,
+    skill_count: data.skill_count || 0,
+  };
+}
+
+export async function fetchConsolidationResult(sessionId: string): Promise<ConsolidatorTrace> {
+  const r = await fetch(
+    `/pipeline/last-consolidation?session_id=${encodeURIComponent(sessionId)}`
+  );
+  const data = await r.json();
+  const status =
+    data.status === "done" ? "done" : data.status === "skipped" ? "skipped" : "pending";
+  return {
+    session_id: data.session_id || sessionId,
+    status,
+    entities_added: data.entities_added || 0,
+    skills_added: data.skills_added || 0,
+    facts_added: data.facts_added || 0,
+    records_expired: data.records_expired || 0,
+    skipped_reason: data.skipped_reason,
+    error: data.error,
+    steps: Array.isArray(data.steps) ? data.steps : [],
+  };
+}
+
+// ── Session CRUD ──
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  const r = await fetch(`/memory/session/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data as Record<string, string>).detail || `HTTP ${r.status}`);
+  }
+}
+
+// ── Graph CRUD ──
+
+export async function searchGraphNodes(
+  q: string,
+  topK = 10
+): Promise<GraphData> {
+  const r = await fetch(
+    `/memory/graph/search?q=${encodeURIComponent(q)}&top_k=${topK}`
+  );
+  const data = await r.json();
+  const nodes: GraphNode[] = ((data.nodes || []) as Record<string, unknown>[]).map(
+    (n) => ({
+      id: (n.node_id as string) || (n.id as string),
+      label: getNodeDisplayText(n),
+      properties: (n.properties as Record<string, unknown>) || n,
+      typeLabel: getNodeTypeLabel(n),
+    })
+  );
+  const edges: GraphEdge[] = ((data.edges || []) as Record<string, unknown>[]).map(
+    (e) => ({
+      source: e.source as string,
+      target: e.target as string,
+      relation: (e.relation as string) || "",
+      confidence: (e.confidence as number) || 0.5,
+      fact: (e.fact as string) || "",
+      evidence: (e.evidence as string) || "",
+      timestamp: (e.timestamp as string) || "",
+      source_session: (e.source_session as string) || "",
+    })
+  );
+  return { nodes, edges, treeRoots: [] };
+}
+
+export async function addGraphNode(
+  id: string,
+  label: string,
+  properties?: Record<string, unknown>
+): Promise<void> {
+  const r = await fetch(`/memory/graph/nodes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, label, properties: properties || {} }),
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data as Record<string, string>).detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function deleteGraphNode(nodeId: string): Promise<void> {
+  const r = await fetch(`/memory/graph/nodes/${encodeURIComponent(nodeId)}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data as Record<string, string>).detail || `HTTP ${r.status}`);
+  }
+}
+
+// ── Skill CRUD ──
+
+export async function deleteSkill(skillId: string): Promise<void> {
+  const r = await fetch(`/memory/skills/${encodeURIComponent(skillId)}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data as Record<string, string>).detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function clearGraphMemory(): Promise<void> {
+  const r = await fetch(`/memory/graph/clear`, {
+    method: "DELETE",
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data as Record<string, string>).detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function clearSkillMemory(): Promise<void> {
+  const r = await fetch(`/memory/skills/clear`, {
+    method: "DELETE",
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data as Record<string, string>).detail || `HTTP ${r.status}`);
+  }
+}
+
+// ── Visual Memory ──
+
+export interface VisualMemoryItem {
+  record_id: string;
+  session_id: string;
+  timestamp: string;
+  caption: string;
+  image_path: string;
+  image_hash: string;
+  scene_type: string;
+  importance_score: number;
+  retrieval_count: number;
+  expired: boolean;
+  entities: Array<{type: string; name: string; confidence: number}>;
+  structured_data?: Record<string, unknown>;
+}
+
+export interface VisualMemoryStats {
+  total: number;
+  active: number;
+  expired: number;
+  by_scene_type: Record<string, number>;
+}
+
+export async function fetchVisualMemories(
+  sessionId?: string,
+  limit = 50,
+  offset = 0,
+  includeExpired = false
+): Promise<VisualMemoryItem[]> {
+  const params = new URLSearchParams();
+  if (sessionId) params.set("session_id", sessionId);
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  params.set("include_expired", String(includeExpired));
+
+  const r = await fetch(`/visual/memories?${params.toString()}`);
+  const data = await r.json();
+  return data.memories || [];
+}
+
+export function fetchVisualMemoryImage(recordId: string): string {
+  return `/visual/memories/${encodeURIComponent(recordId)}/image`;
+}
+
+export async function fetchVisualMemoryStats(): Promise<VisualMemoryStats> {
+  const r = await fetch(`/visual/stats`);
+  const data = await r.json();
+  return {
+    total: data.total || 0,
+    active: data.active || 0,
+    expired: data.expired || 0,
+    by_scene_type: data.by_scene_type || {},
+  };
+}
+
+export async function deleteVisualMemory(recordId: string): Promise<void> {
+  const r = await fetch(`/visual/memories/${encodeURIComponent(recordId)}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error((data as Record<string, string>).detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function searchVisualMemories(query: string, topK = 10): Promise<VisualMemoryItem[]> {
+  const r = await fetch(`/visual/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, top_k: topK }),
+  });
+  const data = await r.json();
+  return data.results || [];
+}

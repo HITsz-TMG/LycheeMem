@@ -1,0 +1,188 @@
+"""LLM 统一抽象基类。"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from contextvars import ContextVar
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# 每轮 pipeline 调用开始时，由 LycheePipeline 设置一个可变 dict 到此 ContextVar；
+# asyncio.to_thread 会复制 Context（包含对同一 dict 对象的引用），因此子线程中的
+# 累加操作会直接修改该 dict，调用方能看到最新值（不需要线程锁，dict 字段 += 受 GIL 保护）。
+# 当 ContextVar 为 None（默认）时，_accumulate_usage 为空操作。
+_token_accumulator: ContextVar[dict[str, int] | None] = ContextVar(
+    "_token_accumulator", default=None
+)
+
+# 各 LLM 调用点在 generate/agenerate 前设置此标签，用于分来源统计 token 消耗。
+_llm_call_source: ContextVar[str] = ContextVar("_llm_call_source", default="unknown")
+
+
+def set_llm_call_source(source: str) -> None:
+    """设置下一次 LLM 调用的来源标签（用于分来源 token 统计）。"""
+    _llm_call_source.set(source)
+
+def _stats_file_from_env(env_name: str, default_name: str) -> Path:
+    stats_dir = os.getenv("LYCHEE_STATS_DIR")
+    if stats_dir:
+        return Path(stats_dir).expanduser() / default_name
+    raw = os.getenv(env_name)
+    if raw:
+        return Path(raw).expanduser()
+    return Path(__file__).parent.parent.parent / "data" / default_name
+
+
+# 统计文件路径：默认 <项目根>/data/token_stats.json，可用 LYCHEE_STATS_DIR 或 TOKEN_STATS_PATH 覆盖。
+_STATS_FILE = _stats_file_from_env("TOKEN_STATS_PATH", "token_stats.json")
+
+
+class _GlobalTokenStats:
+    """进程级累计 token 统计，线程安全，每次更新后原子写入文件。
+
+    写入格式（JSON）::
+
+        {
+          "total_input_tokens": 12345,
+          "total_output_tokens": 6789,
+          "total_tokens": 19134,
+          "last_updated": "2024-01-01T12:00:00+00:00"
+        }
+
+    启动时若文件已存在则自动恢复历史累计值；写入通过临时文件 + rename 保证原子性，
+    最大程度避免并发写入导致的文件损坏。
+    """
+
+    def __init__(self, stats_file: Path) -> None:
+        self._file = stats_file
+        self._lock = threading.Lock()
+        self._input: int = 0
+        self._output: int = 0
+        self._by_source: dict[str, dict[str, int]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """从已有文件恢复历史累计值（失败时静默忽略）。"""
+        try:
+            if self._file.exists():
+                data = json.loads(self._file.read_text(encoding="utf-8"))
+                self._input = int(data.get("total_input_tokens", 0))
+                self._output = int(data.get("total_output_tokens", 0))
+                for src, val in (data.get("by_source") or {}).items():
+                    if isinstance(val, dict):
+                        self._by_source[src] = {
+                            "input_tokens": int(val.get("input_tokens", 0)),
+                            "output_tokens": int(val.get("output_tokens", 0)),
+                            "calls": int(val.get("calls", 0)),
+                            "total_latency_ms": float(val.get("total_latency_ms", 0.0)),
+                        }
+        except Exception:
+            pass
+
+    def add(self, input_tokens: int, output_tokens: int, source: str = "unknown", latency_ms: float = 0.0) -> None:
+        """原子地累加 token 数并刷新文件。"""
+        with self._lock:
+            self._input += input_tokens
+            self._output += output_tokens
+            entry = self._by_source.get(source)
+            if entry is None:
+                entry = {"input_tokens": 0, "output_tokens": 0, "calls": 0, "total_latency_ms": 0.0}
+                self._by_source[source] = entry
+            entry["input_tokens"] += input_tokens
+            entry["output_tokens"] += output_tokens
+            entry["calls"] += 1
+            entry["total_latency_ms"] += latency_ms
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        """持有锁时将统计写入文件（临时文件 + rename 原子替换）。"""
+        try:
+            self._file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "total_input_tokens": self._input,
+                "total_output_tokens": self._output,
+                "total_tokens": self._input + self._output,
+                "last_updated": datetime.now(tz=timezone.utc).isoformat(),
+                "by_source": {
+                    src: {
+                        "calls": v["calls"],
+                        "input_tokens": v["input_tokens"],
+                        "output_tokens": v["output_tokens"],
+                        "total_latency_ms": round(v["total_latency_ms"], 1),
+                        "avg_latency_ms": round(v["total_latency_ms"] / v["calls"], 1) if v["calls"] else 0.0,
+                    }
+                    for src, v in sorted(self._by_source.items())
+                },
+            }
+            tmp = self._file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._file)
+        except Exception:
+            pass  # 统计写入失败不影响主流程
+
+
+_global_token_stats = _GlobalTokenStats(_STATS_FILE)
+
+
+# 支持文本和多模态内容（图片等）
+# 格式参考：https://docs.litellm.ai/docs/
+TextContent = dict[str, str]  # {"type": "text", "text": "..."}
+ImageContent = dict[str, dict[str, str]]  # {"type": "image_url", "image_url": {"url": "..."}}
+ContentItem = TextContent | ImageContent
+MessageContent = str | list[ContentItem]
+Message = dict[str, MessageContent]
+
+
+class BaseLLM(ABC):
+    """所有 LLM 适配器的统一接口。"""
+
+    @staticmethod
+    def _accumulate_usage(input_tokens: int, output_tokens: int, latency_ms: float = 0.0) -> None:
+        """将本次 LLM 调用的 token 计入当前 turn 的累计器，并同步更新全局统计文件。"""
+        # per-turn 累计器
+        acc = _token_accumulator.get()
+        if acc is not None:
+            acc["input"] += input_tokens
+            acc["output"] += output_tokens
+        # 进程级全局累计（按来源分类统计）
+        source = _llm_call_source.get()
+        _global_token_stats.add(input_tokens, output_tokens, source, latency_ms)
+
+    @abstractmethod
+    def generate(
+        self,
+        messages: list[Message],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
+        """同步生成。返回纯文本。"""
+
+    @abstractmethod
+    async def agenerate(
+        self,
+        messages: list[Message],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
+        """异步生成。支持多模态消息（文本 + 图片）。"""
+
+    async def astream_generate(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """流式异步生成，逐 token yield 字符串。
+
+        默认实现：完整生成后作为单个 token 返回（降级兼容）。
+        子类可 override 以实现真实 token 流。
+        """
+        text = await self.agenerate(messages, temperature=temperature, max_tokens=max_tokens)
+        yield text
